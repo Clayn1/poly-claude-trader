@@ -239,16 +239,74 @@ def _determine_action(edge: float, confidence: str) -> str:
 def _parse_claude_response(raw: str) -> dict:
     """
     Extract and parse the JSON object from Claude's response.
-    Handles accidental markdown fences gracefully.
+
+    Handles three common failure modes:
+      1. Markdown fences (```json ... ```)
+      2. Truncated response — MAX_TOKENS cut the JSON mid-stream; we extract
+         whatever valid fields are present using regex fallback
+      3. Unescaped special characters inside string values
+
+    Always returns a dict. On total failure returns a safe fallback that
+    results in a PASS action rather than crashing the cycle.
     """
     text = raw.strip()
+
     # Strip ```json ... ``` fences if present
     if text.startswith("```"):
         lines = text.splitlines()
         text = "\n".join(
             l for l in lines if not l.strip().startswith("```")
         ).strip()
-    return json.loads(text)
+
+    # Happy path
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Recovery 1: find the outermost { ... } block and try again
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Recovery 2: response was truncated — extract whatever fields exist via regex
+    # This handles MAX_TOKENS truncation mid-JSON
+    import re
+    result: dict = {}
+
+    prob_match = re.search(r'"claude_yes_prob"\s*:\s*([0-9.]+)', text)
+    if prob_match:
+        result["claude_yes_prob"] = float(prob_match.group(1))
+
+    conf_match = re.search(r'"confidence"\s*:\s*"(low|medium|high)"', text)
+    if conf_match:
+        result["confidence"] = conf_match.group(1)
+
+    reason_match = re.search(r'"reasoning"\s*:\s*"(.*?)"(?=\s*,|\s*})', text, re.DOTALL)
+    if reason_match:
+        result["reasoning"] = reason_match.group(1)[:500]
+
+    if "claude_yes_prob" in result:
+        logger.warning("Used regex fallback to extract partial JSON — response may be truncated")
+        result.setdefault("confidence", "low")
+        result.setdefault("reasoning", "Truncated response — partial extraction")
+        result.setdefault("key_factors", [])
+        result.setdefault("risks", [])
+        return result
+
+    # Total failure — return safe PASS defaults
+    logger.error("Could not extract any fields from Claude response — returning PASS defaults")
+    return {
+        "claude_yes_prob": 0.5,
+        "confidence":      "low",
+        "reasoning":       "JSON parse failed entirely",
+        "key_factors":     [],
+        "risks":           [],
+    }
 
 
 # ── Analyst ────────────────────────────────────────────────────────────────────
@@ -415,13 +473,6 @@ class ClaudeAnalyst:
 
             parsed = _parse_claude_response(raw_text)
 
-        except json.JSONDecodeError as exc:
-            logger.error(
-                "Failed to parse Claude JSON for %s: %s",
-                market.condition_id[:12], exc,
-            )
-            logger.debug("Raw response: %s", raw_text[:500])
-            return None
         except anthropic.APIError as exc:
             logger.error(
                 "Anthropic API error for %s: %s", market.condition_id[:12], exc
