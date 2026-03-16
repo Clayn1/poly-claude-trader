@@ -33,6 +33,7 @@ from py_clob_client.clob_types import (
     OpenOrderParams,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.exceptions import PolyApiException
 
 load_dotenv()
 
@@ -46,6 +47,7 @@ logger = logging.getLogger("polymarket_client")
 
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"   # market metadata
+DATA_API  = "https://data-api.polymarket.com"    # user positions & activity
 CHAIN_ID = 137                                    # Polygon mainnet
 
 MIN_LIQUIDITY_USDC = 500     # ignore markets thinner than this
@@ -154,10 +156,22 @@ class PolymarketClient:
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _retry(self, fn, *args, **kwargs):
-        """Call fn(*args, **kwargs) with simple retry logic."""
+        """
+        Call fn(*args, **kwargs) with simple retry logic.
+
+        404 errors are never retried — they mean the resource doesn't exist
+        and retrying will never help (and wastes ~10s per call at RETRY_DELAY=2).
+        """
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return fn(*args, **kwargs)
+            except PolyApiException as exc:
+                if exc.status_code == 404:
+                    raise   # permanent — don't retry
+                if attempt == MAX_RETRIES:
+                    raise
+                logger.warning("Attempt %d failed (%s); retrying…", attempt, exc)
+                time.sleep(RETRY_DELAY * attempt)
             except Exception as exc:
                 if attempt == MAX_RETRIES:
                     raise
@@ -337,10 +351,20 @@ class PolymarketClient:
                     yes_mid   = self._extract_price(self._retry(self._clob.get_midpoint, yes_id))
                     no_price  = self._extract_price(self._retry(self._clob.get_price, no_id, side="BUY"))
                     no_mid    = self._extract_price(self._retry(self._clob.get_midpoint, no_id))
+                except PolyApiException as price_exc:
+                    if price_exc.status_code == 404:
+                        # Market resolved or book removed — skip it
+                        logger.debug("No orderbook for %s — skipping", m.get("conditionId", "?")[:12])
+                        continue
+                    logger.warning(
+                        "CLOB price fetch failed for %s (%s) — using 0.0: %s",
+                        m.get("conditionId", "?")[:12], m.get("question", "?")[:50], price_exc,
+                    )
+                    yes_price = yes_mid = no_price = no_mid = 0.0
                 except Exception as price_exc:
                     logger.warning(
                         "CLOB price fetch failed for %s (%s) — using 0.0: %s",
-                        m.get("condition_id", "?")[:12], m.get("question", "?")[:50], price_exc,
+                        m.get("conditionId", "?")[:12], m.get("question", "?")[:50], price_exc,
                     )
                     yes_price = yes_mid = no_price = no_mid = 0.0
 
@@ -438,8 +462,19 @@ class PolymarketClient:
         )
 
     def get_mid_price(self, token_id: str) -> float:
-        """Quick mid-price lookup (no full orderbook needed)."""
-        return self._extract_price(self._retry(self._clob.get_midpoint, token_id))
+        """
+        Quick mid-price lookup (no full orderbook needed).
+
+        Returns 0.0 if the orderbook no longer exists (404) — this happens
+        when a market has resolved and the CLOB has removed its book.
+        """
+        try:
+            return self._extract_price(self._retry(self._clob.get_midpoint, token_id))
+        except PolyApiException as exc:
+            if exc.status_code == 404:
+                logger.debug("No orderbook for token %s (market resolved?)", token_id[:16])
+                return 0.0
+            raise
 
     # ── Order placement ────────────────────────────────────────────────────────
 
@@ -580,47 +615,51 @@ class PolymarketClient:
 
     def get_positions(self) -> list[Position]:
         """
-        Derive open positions from trade history.
+        Fetch currently held positions from the Polymarket Data API.
 
-        Aggregates fills per token to compute net size and average entry price.
-        Returns only tokens with a non-zero net position.
+        Uses GET data-api.polymarket.com/positions?user=<proxy_address>
+        This endpoint only returns tokens you actively hold, so there is no
+        risk of calling get_mid_price on resolved/deleted orderbooks.
+
+        No authentication required — the proxy address is public.
         """
         self._check_authenticated()
-        trades = self.get_trades()
 
-        # Aggregate fills per token
-        token_data: dict[str, dict] = {}
-        for t in trades:
-            tid   = t.get("asset_id", "")
-            side  = t.get("side", "").upper()
-            size  = float(t.get("size", 0))
-            price = float(t.get("price", 0))
+        proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS", "")
+        if not proxy_address:
+            logger.warning("POLYMARKET_PROXY_ADDRESS not set — cannot fetch positions")
+            return []
 
-            if tid not in token_data:
-                token_data[tid] = {"net_size": 0.0, "cost_basis": 0.0, "condition_id": t.get("market", "")}
-
-            if side == "BUY":
-                token_data[tid]["net_size"]   += size
-                token_data[tid]["cost_basis"] += size * price
-            else:
-                token_data[tid]["net_size"]   -= size
-                token_data[tid]["cost_basis"] -= size * price
+        try:
+            resp = requests.get(
+                f"{DATA_API}/positions",
+                params={"user": proxy_address, "sizeThreshold": "0.01"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            raw_positions = resp.json()
+        except Exception as exc:
+            logger.warning("Failed to fetch positions from Data API: %s", exc)
+            return []
 
         positions = []
-        for tid, data in token_data.items():
-            net = data["net_size"]
-            if abs(net) < 0.01:
+        for pos in raw_positions:
+            tid  = pos.get("asset", "")
+            size = float(pos.get("size", 0))
+
+            if not tid or size < 0.01:
                 continue
 
-            avg_price     = (data["cost_basis"] / net) if net != 0 else 0
+            avg_price     = float(pos.get("avgPrice", 0))
             current_price = self.get_mid_price(tid)
-            unrealized    = net * (current_price - avg_price)
+            unrealized    = size * (current_price - avg_price)
+            side          = pos.get("outcome", "Yes").upper()
 
             positions.append(Position(
                 token_id       = tid,
-                condition_id   = data["condition_id"],
-                side           = "YES" if net > 0 else "NO",
-                size           = abs(net),
+                condition_id   = pos.get("conditionId", ""),
+                side           = side,
+                size           = round(size, 4),
                 avg_price      = round(avg_price, 4),
                 current_price  = round(current_price, 4),
                 unrealized_pnl = round(unrealized, 4),
@@ -630,14 +669,20 @@ class PolymarketClient:
 
     def get_usdc_balance(self) -> float:
         """
-        Return available USDC balance in human-readable USDC (not wei).
+        Return available USDC balance of the proxy/funder wallet in USDC.
 
-        get_balance() returns micro-USDC (wei), so we divide by 1e6.
-        e.g. 1_000_000 wei → 1.0 USDC
+        Important: get_balance() returns the *signer key* wallet balance, which
+        is typically 0 for email/Magic logins — the actual funds live in the
+        proxy wallet (POLYMARKET_PROXY_ADDRESS). We query that address directly
+        via get_balance_allowance() with AssetType.COLLATERAL (= USDC).
+        The returned value is in wei (micro-USDC), so we divide by 1e6.
         """
         self._check_authenticated()
         try:
-            bal_wei = self._clob.get_balance()
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._clob.get_balance_allowance(params)
+            bal_wei = result.get("balance", "0") if isinstance(result, dict) else result
             return float(bal_wei or 0) / 1_000_000
         except Exception as exc:
             logger.warning("Could not fetch balance: %s", exc)

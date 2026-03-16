@@ -219,6 +219,7 @@ class Strategy:
         entry_price = self._entry_price(market, action)
         now         = datetime.now(timezone.utc).isoformat()
         order_resp  = {}
+        order_succeeded = False   # set True only on confirmed placement
 
         # Hard guard — belt-and-suspenders on top of the config check.
         # If the client was initialised read-only, placing an order would
@@ -256,6 +257,7 @@ class Strategy:
                     size_usdc    = decision.size_usdc,
                     entry_price  = entry_price,
                 )
+                order_succeeded = True
 
                 logger.info(
                     "Order placed: %s $%.2f @ %.4f → %s",
@@ -265,18 +267,20 @@ class Strategy:
             except Exception as exc:
                 logger.error("Order placement failed for %s: %s", market.condition_id[:12], exc)
                 order_resp = {"error": str(exc)}
+                order_succeeded = False
 
+        filled = order_succeeded and not self.config.dry_run and not self.client.read_only
         record = TradeRecord(
             timestamp        = now,
             condition_id     = market.condition_id,
             question         = market.question,
             action           = action,
-            approved         = True,
+            approved         = filled or self.config.dry_run,  # dry-run counts as approved
             size_usdc        = decision.size_usdc,
             entry_price      = entry_price,
             edge             = analysis.edge,
             confidence       = analysis.confidence,
-            rejection_reason = "",
+            rejection_reason = "" if (filled or self.config.dry_run) else order_resp.get("error", "order failed"),
             dry_run          = self.config.dry_run,
             order_response   = order_resp,
         )
@@ -328,6 +332,16 @@ class Strategy:
             status["open_markets"],
             status["daily_pnl"],
             )
+
+        # Pre-flight balance check — skip the whole scan if we can't afford
+        # even the minimum bet. Avoids burning Claude API calls and order
+        # retries when the account is empty.
+        if not self.config.dry_run and balance < self.risk.config.min_bet_usdc:
+            logger.warning(
+                "Balance $%.2f is below min_bet_usdc $%.2f — skipping cycle.",
+                balance, self.risk.config.min_bet_usdc,
+            )
+            return []
 
         # 3. Market scan
         markets = self._scan_markets()
