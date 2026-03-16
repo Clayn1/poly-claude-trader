@@ -51,8 +51,8 @@ class StrategyConfig:
     scan_limit: int              = 50
     volume_min: float            = 5_000.0
     liquidity_min: float         = 2_000.0
-    end_date_max: Optional[str]  = None
-    end_date_min: Optional[str]  = None
+    end_date_min: Optional[str]  = None   # exclude markets resolving before this
+    end_date_max: Optional[str]  = None   # exclude markets resolving after this
     tag_id: Optional[int]        = None
     order_by: str                = "volume"
     use_limit_orders: bool       = True
@@ -135,11 +135,28 @@ class Strategy:
             ascending     = False,
             volume_min    = self.config.volume_min,
             liquidity_min = self.config.liquidity_min,
-            end_date_max  = self.config.end_date_max,
             end_date_min  = self.config.end_date_min,
+            end_date_max  = self.config.end_date_max,
             tag_id        = self.config.tag_id,
             closed        = False,
         )
+        # Deduplicate similar markets — e.g. "Will ETH be above $X?" for 5 prices.
+        # Group by the first 6 words of the question (the common prefix), keep the
+        # one with the most liquidity (most tradeable) from each group.
+        seen_prefixes: dict[str, MarketInfo] = {}
+        for m in markets:
+            prefix = " ".join(m.question.lower().split()[:6])
+            existing = seen_prefixes.get(prefix)
+            if existing is None or m.liquidity > existing.liquidity:
+                seen_prefixes[prefix] = m
+        deduped = list(seen_prefixes.values())
+        if len(deduped) < len(markets):
+            logger.info(
+                "Deduplicated %d similar markets → %d unique",
+                len(markets), len(deduped),
+            )
+        markets = deduped
+
         logger.info("Found %d candidate markets", len(markets))
         return markets
 
@@ -186,11 +203,11 @@ class Strategy:
                 if pos.side == "YES":
                     # We held YES — won if market resolved YES (price → 1.0)
                     resolved_yes = market.yes_mid >= 0.99
-                    pnl = (1.0 - pos.avg_price) * pos.size if resolved_yes else -pos.avg_price * pos.size
+                    pnl = (1.0 - pos.avg_price) * pos.size if resolved_yes                           else -pos.avg_price * pos.size
                 else:
                     # We held NO — won if market resolved NO (price → 1.0)
                     resolved_no = market.no_mid >= 0.99
-                    pnl = (1.0 - pos.avg_price) * pos.size if resolved_no else -pos.avg_price * pos.size
+                    pnl = (1.0 - pos.avg_price) * pos.size if resolved_no                           else -pos.avg_price * pos.size
 
                 self.risk.record_close(pos.condition_id, pnl)
                 logger.info(
@@ -218,7 +235,7 @@ class Strategy:
         token_id    = market.yes_token_id if action == "BUY_YES" else market.no_token_id
         entry_price = self._entry_price(market, action)
         now         = datetime.now(timezone.utc).isoformat()
-        order_resp  = {}
+        order_resp      = {}
         order_succeeded = False   # set True only on confirmed placement
 
         # Hard guard — belt-and-suspenders on top of the config check.

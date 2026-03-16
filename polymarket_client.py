@@ -401,14 +401,15 @@ class PolymarketClient:
         markets = self.get_active_markets.__wrapped__ if hasattr(
             self.get_active_markets, "__wrapped__"
         ) else None
-        # Re-use the full parsing logic via a single-item fetch
         for m in raw_list[:1]:
             try:
-                tokens    = m.get("tokens", [])
-                yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), tokens[0])
-                no_token  = next((t for t in tokens if t.get("outcome") == "No"),  tokens[1])
-                yes_id    = yes_token["token_id"]
-                no_id     = no_token["token_id"]
+                raw_ids  = m.get("clobTokenIds", "[]")
+                token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                if len(token_ids) < 2:
+                    logger.warning("get_market_by_id: fewer than 2 tokens for %s", condition_id[:12])
+                    return None
+                yes_id = token_ids[0]
+                no_id  = token_ids[1]
                 return MarketInfo(
                     condition_id = m.get("conditionId", ""),
                     question     = m.get("question", ""),

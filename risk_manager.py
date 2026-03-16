@@ -51,13 +51,13 @@ class RiskConfig:
     bankroll: float               = 1_000.0
     kelly_fraction: float         = 0.25
     min_bet_usdc: float           = 5.0
-    max_bet_usdc: float           = 100.0
+    max_bet_usdc: float           = 20.0
     max_position_pct: float       = 0.10     # 10% of bankroll per market
     max_total_exposure_pct: float = 0.50     # 50% of bankroll total
     max_daily_loss_pct: float     = 0.05     # 5% daily drawdown kills the bot
     max_open_positions: int       = 10
     min_edge: float               = 0.05
-    min_confidence: str           = "medium"  # "low" | "medium" | "high"
+    min_confidence: str           = "low"     # "low" | "medium" | "high"
     min_liquidity_usdc: float     = 1_000.0
 
 
@@ -260,9 +260,10 @@ class RiskManager:
 
         kelly_size = self._kelly_size(edge, win_prob)
 
-        # Apply hard caps
+        # Apply hard caps — only cap the ceiling, never inflate the floor.
+        # If Kelly says bet less than the minimum, the trade gets rejected
+        # below rather than silently upsized.
         size = kelly_size
-        size = max(size, self.config.min_bet_usdc)
         size = min(size, self.config.max_bet_usdc)
 
         # Don't exceed remaining room in per-market limit

@@ -50,13 +50,21 @@ ANALYSIS_MODEL = "claude-sonnet-4-6"
 # News fetch model — just summarising web results, no deep reasoning needed
 NEWS_MODEL = "claude-haiku-4-5-20251001"
 
-MAX_TOKENS = 2_048
+MAX_TOKENS = 1_024   # shorter JSON response is all we need — halves output cost
 
 # Minimum edge (Claude prob - market prob) to recommend a trade
-MIN_EDGE_TO_TRADE = 0.05        # 5 percentage points
+# Lower = more trades, higher = more selective. Start at 3% and tune from data.
+MIN_EDGE_TO_TRADE = 0.03        # 3 percentage points
 
-# Cache TTL — don't re-analyse the same market within this window
-CACHE_TTL_SECONDS = 60 * 30    # 30 minutes
+# Cache TTL — re-use analyses within this window to save API calls
+CACHE_TTL_SECONDS = 60 * 45    # 45 minutes (was 30)
+
+# Keywords that indicate a pure price-bracket market where news is useless
+_PRICE_MARKET_KEYWORDS = (
+    "price of", "above $", "below $", "reach $", "exceed $",
+    "higher than $", "lower than $", "over $", "under $",
+    "at least $", "at most $",
+)
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -208,10 +216,19 @@ def _cache_key(condition_id: str) -> str:
     return hashlib.md5(condition_id.encode()).hexdigest()
 
 
+def _is_price_market(question: str) -> bool:
+    """Return True if the market is a pure price-bracket bet (news won't help)."""
+    q = question.lower()
+    return any(kw in q for kw in _PRICE_MARKET_KEYWORDS)
+
+
 def _determine_action(edge: float, confidence: str) -> str:
-    """Translate edge + confidence into a trading action."""
-    if confidence == "low":
-        return "PASS"
+    """
+    Translate edge + confidence into a trading action.
+
+    Low-confidence trades are allowed — Kelly sizing will naturally
+    produce a smaller bet for weaker signals.
+    """
     if edge >= MIN_EDGE_TO_TRADE:
         return "BUY_YES"
     if edge <= -MIN_EDGE_TO_TRADE:
@@ -370,9 +387,11 @@ class ClaudeAnalyst:
 
         logger.info("Analysing market: %s", market.question[:80])
 
-        # 3. Fetch news context via Haiku (cheap)
+        # 3. Fetch news context via Haiku — skip for price-bracket markets
+        #    ("Will ETH be above $2000?") since current price is all that matters
+        #    and news context won't change the analysis meaningfully.
         news_context = ""
-        if self.use_web_search:
+        if self.use_web_search and not _is_price_market(market.question):
             news_context = self._fetch_news_context(market)
 
         # 4. Build the analysis prompt

@@ -50,7 +50,7 @@ from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 
-from env_helpers import env_int, env_str, env_float, env_bool
+from env_helpers import env_int, env_bool, env_float, env_str
 from polymarket_client import PolymarketClient
 from claude_analyst import ClaudeAnalyst
 from risk_manager import RiskManager, RiskConfig
@@ -103,35 +103,38 @@ def _setup_logging(log_file: str, log_level: str = "INFO"):
 
 def _build_risk_config() -> RiskConfig:
     return RiskConfig(
-        bankroll               = env_float("BANKROLL", 1_000.0),
-        kelly_fraction         = env_float("KELLY_FRACTION", 0.25),
-        max_bet_usdc           = env_float("MAX_BET_USDC", 100.0),
-        max_daily_loss_pct     = env_float("MAX_DAILY_LOSS_PCT", 0.05),
-        max_open_positions     = env_int  ("MAX_OPEN_POSITIONS", 10),
-        min_confidence         = env_str  ("MIN_CONFIDENCE", "medium"),
+        bankroll               = env_float("BANKROLL",            1_000.0),
+        kelly_fraction         = env_float("KELLY_FRACTION",      0.25),
+        max_bet_usdc           = env_float("MAX_BET_USDC",        100.0),
+        max_daily_loss_pct     = env_float("MAX_DAILY_LOSS_PCT",  0.05),
+        max_open_positions     = env_int  ("MAX_OPEN_POSITIONS",  10),
+        min_confidence         = env_str  ("MIN_CONFIDENCE",      "medium"),
     )
 
 def _build_strategy_config() -> StrategyConfig:
     tag_id_raw    = env_str("TAG_ID", "")
     horizon_hours = env_int("HORIZON_HOURS", 48)
-    hours_to_resolution = env_int("MIN_HOURS_TO_RESOLUTION", 2)
     end_date_max  = (
             datetime.now(timezone.utc) + timedelta(hours=horizon_hours)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_date_min  = (
+
+    # end_date_min: don't fetch markets that resolve within MIN_HOURS_TO_RESOLUTION
+    # This prevents the analyst from wasting time on markets about to expire.
+    hours_to_resolution = env_int("MIN_HOURS_TO_RESOLUTION", 2)
+    end_date_min = (
             datetime.now(timezone.utc) + timedelta(hours=hours_to_resolution)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return StrategyConfig(
-        dry_run              = env_bool ("DRY_RUN", True),
-        scan_limit           = env_int  ("SCAN_LIMIT", 50),
-        volume_min           = env_float("VOLUME_MIN", 5_000.0),
-        liquidity_min        = env_float("LIQUIDITY_MIN", 2_000.0),
-        end_date_max         = end_date_max,
+        dry_run              = env_bool ("DRY_RUN",          True),
+        scan_limit           = env_int  ("SCAN_LIMIT",       50),
+        volume_min           = env_float("VOLUME_MIN",       5_000.0),
+        liquidity_min        = env_float("LIQUIDITY_MIN",    2_000.0),
         end_date_min         = end_date_min,
+        end_date_max         = end_date_max,
         tag_id               = int(tag_id_raw) if tag_id_raw.isdigit() else None,
         use_limit_orders     = env_bool ("USE_LIMIT_ORDERS", True),
-        delay_between_trades = env_float("TRADE_DELAY_SEC", 2.0),
+        delay_between_trades = env_float("TRADE_DELAY_SEC",  2.0),
     )
 
 
@@ -176,9 +179,9 @@ def _print_banner(risk_cfg: RiskConfig, strat_cfg: StrategyConfig, scan_interval
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    log_file  = env_str("LOG_FILE", "bot.log")
+    log_file  = env_str("LOG_FILE",  "bot.log")
     log_level = env_str("LOG_LEVEL", "INFO")
-    scan_interval  = env_int("SCAN_INTERVAL_SECONDS", 300)
+    scan_interval  = env_int("SCAN_INTERVAL_SECONDS",    300)
     heartbeat_every = env_int("HEARTBEAT_EVERY_N_CYCLES", 5)
     use_web_search  = env_bool("USE_WEB_SEARCH", True)
 
